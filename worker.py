@@ -8,6 +8,9 @@ from threading import Thread
 import base64, json
 import zlib
 
+# redis task format:
+# task id, client id, worker id, task type, task status, timestamp,  error
+
 # need to see how it works, please ensure since we are outght to communicate using json shit, some of the thigns might need tweakign to acept n reject, i have made the consumer and producer serialzie and deserialze json data, so work accordingly wihtotu changing that as it makes passing data across the dis. sys. easy
 
 class YADTQWorker:
@@ -25,6 +28,7 @@ class YADTQWorker:
                                       value_serializer = lambda x: json.dumps(x).encode('utf-8')
         )
         self.current_task = None
+        self.client_id = None
 
     # ok shit had to do it one under another, aghhhh
     def send_heartbeat(self):
@@ -34,6 +38,7 @@ class YADTQWorker:
                             "worker_id" : self.workerID,
                             "timestamp" : str(dt.now()),
                             "current_task" : self.current_task,
+                            "client_id" : self.client_id,
                             "working_status" : working_status
             } # lil redundant to send current_task as well as working status but makes it clean and easy so let it be 
             try:
@@ -72,10 +77,10 @@ class YADTQWorker:
 
     def run_task(self, task_data):
 
-        task_id = task_data["task_id"]
-        task_type = task_data["task"]
-        client_id = task_data["client_data"]
-        args = task_data["args"]
+        task_id = task_data.get("task_id")
+        task_type = task_data.get("task_type")
+        self.client_id = task_data.get("client_id")
+        args = task_data.get("args")
         # ok why encode utf8, b64decode adn then decode utf 8?
         file_content = base64.b64decode(args["file_content"].encode("utf-8")) 
         file_content_str = file_content.decode("utf-8") 
@@ -83,7 +88,8 @@ class YADTQWorker:
         # print(file_content_str, type(file_content_str))
         # print("---------------------------------------")
 
-        self.redis.hset(f"task:{task_id}", mapping={"status": "processing", "type": task_type, "timestamp": str(dt.now()), "error": ""})
+        # task id, client id, worker id, task type, task status, timestamp,  error
+        self.redis.hset(f"task:{task_id}", mapping={"client_id": self.client_id,"worker_id": self.workerID, "type": task_type,"status": "processing", "timestamp": str(dt.now()), "error": ""})
         
         try:
             print(f"doing task {task_id}: {task_data['task']} with {file_content_str}")
@@ -92,31 +98,52 @@ class YADTQWorker:
             
             time.sleep(7)
             print(f"Finished task {task_id}: {task_data['task']} with {task_data['args']}")
+            self.client_id = None
             # little confusion, have to rename status as task_status or wtv status prply, and other things n all
             result_data = {
                           "task_id" : task_id,
-                          "client_id" : client_id,
+                          "client_id" : self.client_id,
                           "worker_id" : self.workerID,
                           "task_status" : "success",
                           "result" : processed_data
             }
 
+            # task id, client id, worker id, task type, task status, timestamp,  error
+            #self.redis.hset(f"task:{task_id}", mapping={"client_id": self.client_id,"worker_id": self.workerID, "type": task_type,"status": "success", "timestamp": str(dt.now()), "error": ""})
+        
             # print("result: ", processed_data)
             # print("type: ", type(processed_data))
             # print("---------------------------------------")
             #ordering matter
             self.producer.send(RESULT_TOPIC, value = result_data)
-            self.redis.hset(f"task : {task_id}", mapping = {"status" : "success", "type" : task_type, "timestamp" : str(dt.now()), "error" : "", "result" : processed_data})
+            # self.redis.hset(
+            #                 f"task : {task_id}",
+            #                 mapping = {"status" : "success", "type" : task_type, "timestamp" : str(dt.now()), "error" : "", "result" : processed_data}
+            # )
             self.current_task = None
+            self.client_id = None
         except Exception as e:
             err = str(e)
             print(f"Error: {err}")
-            result_data = {"task_id": task_id, "status": "failed", "error": err}
+            result_data = {
+                           "task_id" : task_id,
+                           "status" : "failed",
+                           "client_id" : self.client_id,
+                           "worker_id" : self.workerID,
+                           "error" : err
+            }
             self.producer.send(RESULT_TOPIC, value = result_data)
-            self.redis.hset(
-                            f"task:{task_id}",
-                            mapping={"status": "failed", "type": task_type, "timestamp": str(dt.now()), "error": err}
-            )
+            self.current_task = None
+            self.client_id = None
+
+            # task id, client id, worker id, task type, task status, timestamp,  error
+            self.redis.hset(f"task:{task_id}", mapping={"client_id": self.client_id,"worker_id": self.workerID, "type": task_type,"status": "failed", "timestamp": str(dt.now()), "error": err})
+        
+
+            # self.redis.hset(
+            #                 f"task:{task_id}",
+            #                 mapping={"status": "failed", "type": task_type, "timestamp": str(dt.now()), "error": err}
+            # )
 
 
     def start(self):

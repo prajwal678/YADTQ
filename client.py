@@ -55,7 +55,12 @@ class YADTQClient:
 
     def send_task(self, task_type, file_path=None):
         task_id = str(uuid.uuid4())
-        task_data = {"task_id" : task_id, "task" : task_type, "client_id" : self.client_ID, "timestamp" : str(dt.now())}
+        task_data = {
+                     "task_id" : task_id,
+                     "task" : task_type,
+                     "client_id" : self.client_ID,
+                     "timestamp" : str(dt.now())
+        }
 
         if file_path:
             ftp_file_name = self.upload_to_ftp(file_path, task_id)
@@ -77,7 +82,7 @@ class YADTQClient:
                         for record in records:
                             result_data = record.value
                             if result_data["task_id"] == task_id:
-                                status = result_data["status"]
+                                status = result_data["task_status"]
                                 if status == "success":
                                     if "ftp_file_name" in result_data:
                                         ftp_file_name = result_data["ftp_file_name"]
@@ -87,11 +92,12 @@ class YADTQClient:
                                         return result_data["result"]
                                 elif status == "failed":
                                     return f"Task failed: {result_data['error']}"
-
+            
+            # @chintu please check wt this is
             # Timeout elapsed, resend the task
             retries += 1
             print(f"Timeout reached. Resending task... (Attempt {retries}/{self.MAX_RETRIES})")
-            self.producer.send(TASK_TOPIC, value={"task_id": task_id, "task": "resend"})
+            self.producer.send(TASK_TOPIC, value = {"task_id": task_id, "task": "resend"})
 
         return "Task failed: Max retries exceeded."
 

@@ -1,15 +1,12 @@
 import uuid
 import json
 import base64
-import time
+from datetime import datetime as dt
 from kafka import KafkaProducer, KafkaConsumer
-from kafka.errors import KafkaTimeoutError
 from config import KAFKA_BROKER, TASK_TOPIC, RESULT_TOPIC
 
 
 class YADTQClient:
-    TIMEOUT = 30  # Timeout in seconds to wait for a result before resending
-    MAX_RETRIES = 3  # Maximum number of retries for resending tasks
 
     def __init__(self):
         self.producer = KafkaProducer(
@@ -25,60 +22,75 @@ class YADTQClient:
             auto_offset_reset="earliest",
         )
         self.ID = str(uuid.uuid4())
+        self.MESSAGE_LIMIT = 1024 * 1024 
+        self.estimated_metadata_size = 1024
+        self.max_chunk_size = self.calculate_max_chunk_size()
 
-    def read_file(self, file_path):
-        """Reads the content of a file and encodes it in Base64."""
-        with open(file_path, "rb") as file:
-            return base64.b64encode(file.read()).decode("utf-8")
+    def calculate_max_chunk_size(self):
+        overhead_factor = 4 / 3
+        return int((self.MESSAGE_LIMIT - self.estimated_metadata_size) / overhead_factor)
 
     def write_file(self, content, dst_file_path):
-        """Decodes Base64 content and writes it to a file."""
         with open(dst_file_path, "wb") as file:
             file.write(base64.b64decode(content.encode("utf-8")))
 
     def send_task(self, task_type, file_path=None):
         task_id = str(uuid.uuid4())
-        task_data = {"client_id": self.ID, "task_id": task_id, "task": task_type}
+        base_task_data = {
+            "client_id": self.ID,
+            "task_id": task_id,
+            "task": task_type,
+            "timestamp": str(dt.now()),
+            "total_parts": 0,
+            "args": {}
+        }
 
-        if file_path:
-            file_content = self.read_file(file_path)
-            task_data["args"] = {"file_content": file_content}
+        try:
+            with open(file_path, "rb") as file:
+                file_content = file.read()
+            file_size = len(file_content)
 
-        self.producer.send(TASK_TOPIC, value=task_data)
-        return task_id, task_data
+            chunks = [file_content[i:i + self.max_chunk_size] for i in range(0, file_size, self.max_chunk_size)]
+            total_parts = len(chunks)
+            base_task_data["total_parts"] = total_parts
 
-    def get_result(self, task_id, dst_file_path=None, task_data=None):
-        retries = 0
+            for part_num, chunk in enumerate(chunks, start=1):
+                task_chunk = base_task_data.copy()
+                task_chunk["args"]["part"] = part_num
+                task_chunk["args"]["file_content"] = base64.b64encode(chunk).decode("utf-8")
 
-        while retries < self.MAX_RETRIES:
-            start_time = time.time()
+                # serialized_chunk = json.dumps(task_chunk).encode("utf-8")
+                # if len(serialized_chunk) > self.MESSAGE_LIMIT:
+                #     raise ValueError(f"Message size exceeds 1 MB for part {part_num}. Reduce metadata size or chunk size.")
 
-            while time.time() - start_time < self.TIMEOUT:
-                message = self.consumer.poll(timeout_ms=1000)
-                if message:
-                    for _, records in message.items():
-                        for record in records:
-                            result_data = record.value
-                            if result_data["task_id"] == task_id:
-                                status = result_data["status"]
-                                if status == "success":
-                                    if "file_content" in result_data:
-                                        file_content = result_data["file_content"]
-                                        self.write_file(file_content, dst_file_path)
-                                        return f"Result file saved as {dst_file_path}"
-                                    else:
-                                        return result_data["result"]
-                                elif status == "failed":
-                                    return f"Task failed: {result_data['error']}"
+                self.producer.send(TASK_TOPIC, value=task_chunk)
 
-            # Timeout elapsed, resend the task
-            retries += 1
-            print(f"Timeout reached. Resending task... (Attempt {retries}/{self.MAX_RETRIES})")
-            self.producer.send(
-                TASK_TOPIC, value=task_data
-            )
+            print(f"Task {task_id} sent with {total_parts} part(s).")
+            
+        except FileNotFoundError:
+            print("Invalid File Path")
+            return None
+        
+        except ValueError as e:
+            print(e)
+            return None
 
-        return "Task failed: Max retries exceeded."
+        return task_id
+
+    def get_result(self, task_id, dst_file_path=None):
+        for message in self.consumer:
+            result_data = message.value
+            if result_data["task_id"] == task_id:
+                status = result_data["task_status"]
+                if status == "success":
+                    if "file_content" in result_data:
+                        file_content = result_data["file_content"]
+                        self.write_file(file_content, dst_file_path)
+                        return f"Result file saved as {dst_file_path}"
+                    else:
+                        return result_data["result"]
+                elif status == "failed":
+                    return f"Task failed: {result_data['error']}"
 
     def choose_task(self):
         print(
@@ -87,6 +99,7 @@ class YADTQClient:
               2. Decode
               3. Compression
               4. Decompression
+              5. Exit
               """
         )
         ch = int(input("Enter your choice : "))
@@ -94,18 +107,28 @@ class YADTQClient:
         if ch in [1, 2, 3, 4]:
             file_path = input("Enter path of file to process: ")
             dst_file_path = input("Enter destination path to save result: ")
-            
+
+            print()
             task_type = ["encode", "decode", "compression", "decompression"][ch - 1]
-            task_id, task_data = self.send_task(task_type, file_path=file_path)
-            
-            print(f"Task {task_id} sent. Waiting for result...")
-            res = self.get_result(task_id, dst_file_path=dst_file_path, task_data=task_data)
+            task_id = self.send_task(task_type, file_path=file_path)
+
+            if task_id is None:
+                return 1
+
+            print(f"\n~Task {task_id} sent. Waiting for result...")
+            res = self.get_result(task_id, dst_file_path=dst_file_path)
             print(f"Result: {res}")
+
+        elif ch == 5:
+            return 0
         else:
             print("Invalid choice.")
 
+        print("\n\t----------------------------------------------------------------\n\n")
+        return 1
 
 # Run the client
 if __name__ == "__main__":
     client = YADTQClient()
-    client.choose_task()
+    while client.choose_task():
+        pass
