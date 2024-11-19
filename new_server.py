@@ -3,7 +3,7 @@ from threading import Thread, Lock
 from kafka import KafkaProducer, KafkaConsumer
 import time, json
 from datetime import datetime as dt, timedelta
-from config import REDIS_HOST, REDIS_PORT, KAFKA_BROKER, LOG_TOPIC, TASK_TOPIC, TASK_TOPIC_WORKER, RESULT_TOPIC, HEARTBEAT_TOPIC, NO_OF_WORKERS
+from config import REDIS_HOST, REDIS_PORT, KAFKA_BROKER, LOG_TOPIC, TASK_TOPIC, TASK_TOPIC_WORKER, RESULT_TOPIC_CLIENT, RESULT_TOPIC, HEARTBEAT_TOPIC, NO_OF_WORKERS
 
 # change args across all to file_content
 #loads or dumps check maadi
@@ -44,7 +44,7 @@ class YADTQServer:
         # some variables might be useless need to recheck i defined them before writing code
         self.heartbeat_interval_time = 15
         self.verify_timeout = 10 #lil random
-        self.worker_timeout = 12 # because I DID NOT CONSIDER THAT SERVER CAN ALSO MESS UP
+        self.worker_timeout = 12 # has to be in seconds
 
         self.retry_max = 3
         self.retry_delay = 7
@@ -57,7 +57,7 @@ class YADTQServer:
         try:
             verification_msg = {
                                 'type' : 'ping',
-                                'timestamp' : str(dt.now())
+                                'timestamp' : dt.now()
             }
             self.producer.send(
                                f"worker {worker_id} verification msg", value = verification_msg
@@ -83,23 +83,51 @@ class YADTQServer:
             now_time = dt.now()
             working_status = heartbeat_data.get('working_status')
             current_task = heartbeat_data.get('current_task')
+            # log busy and idle workers
+            worker_stat_data = {
+                "timestamp" : dt.now(),
+                "title" : "Worker_Information",
+                "worker_id" : worker_id,
+                "client_id" : heartbeat_data.get('client_id'),
+                "worker_status" : working_status,
+                "current_task" : current_task
+            }                  
+            self.producer.send(LOG_TOPIC,value=worker_stat_data)
+
 
             if worker_id not in self.worker_states:
                 self.worker_states[worker_id] = {
-                                                 "last_seen" : str(now_time),
+                                                 "last_seen" : now_time,
                                                  "status" : "active",
                                                  'current_task' : None,
-                                                 'ver_tries' : 0
+                                                 'ver_tries' : 0,
+                                                 'client_id' : None
                 }
             else:
                 self.worker_states[worker_id].update({
-                                                      'last_seen' : str(now_time),
+                                                      'last_seen' : now_time,
                                                       'status' : "active",
+                                                      'client_id' : heartbeat_data.get('client_id')
                 })
 
             if (working_status) and (current_task):
+
+                # log processing tasks (based on employed or idle)
+                proc_task_data = {
+                    "timestamp" : dt.now(),
+                    "title" : "Task_Information",
+                    "task_id" : current_task,
+                    "client_id" : heartbeat_data.get('client_id'),
+                    "worker_id" : worker_id,
+                    "task_type" : "?",
+                    "task_status" : "Processing",
+                    "retry_count" : "?",
+                    "error" : None
+                }
+                self.producer.send(LOG_TOPIC,value=proc_task_data)
+
                 self.active_workers[worker_id] = {
-                                                  'last_seen': time.time(),
+                                                  'last_seen': dt.now(),
                                                   'status': 'active',
                                                   'current_task': current_task
                 }
@@ -118,7 +146,7 @@ class YADTQServer:
                     dead_worker = [] # pop these lil shiz
 
                     for worker_id, worker_state in self.worker_states.items():
-                        time_since_last_seen = now_time - worker_state['last_seen']
+                        time_since_last_seen = (now_time - worker_state['last_seen']).total_seconds()
                         
                         if time_since_last_seen > self.worker_timeout:
                             if worker_state['ver_tries'] < 3:
@@ -132,6 +160,16 @@ class YADTQServer:
                                 worker_state['ver_tries'] += 1
                             else:
                                 dead_worker.append(worker_id)
+                                # dead worker log
+                                worker_dead_data = {
+                                    "timestamp" : dt.now(),
+                                    "title" : "Worker_Information",
+                                    "worker_id" : worker_id,
+                                    "client_id" : worker_state['client_id'],
+                                    "worker_status" : "Dead",
+                                    "current_task" : None
+                                }   
+                                self.producer.send(LOG_TOPIC,value=worker_dead_data)
 
                     for worker_id in dead_worker:
                         worker_state = self.worker_states.pop(worker_id)
@@ -145,6 +183,13 @@ class YADTQServer:
 
             except Exception as e:
                 print(f"err in checking health: {e}")
+                error_log_health_check = {
+                    "timestamp" : dt.now(),
+                    "title" : "error_Information",
+                    "Function" : "Check_Worker_Health",
+                    "error" : str(e)
+                }
+                self.producer.send(LOG_TOPIC,value=error_log_health_check)
             
             time.sleep(self.retry_delay)
 
@@ -156,28 +201,51 @@ class YADTQServer:
                     break
                 try:
                     task_data = msg.value
+                    print(task_data)
                     task_id = task_data.get("task_id")
-
                     if not self.redis.exists(task_id):
+                        # print("client_id", task_data.get('client_id'))
+                        # print("task", task_data.get('task'))
                         #print(f"task {task_id} not in redis, retrying")
-                        #self.redis.hset(f"task : {task_id}", mapping={"status" : "queued", "created_at" : str(dt.now()), "retry_count" : 0})
+                        #self.redis.hset(f"task : {task_id}", mapping={"status" : "queued", "created_at" : dt.now(), "retry_count" : 0})
                         # task id, client id, worker id, task type, task status, timestamp,  error
                         self.redis.hset(
-                                        f"task:{task_id}",
+                                        f"task : {task_id}",
                                         mapping = {
                                                    "client_id" : task_data.get('client_id'),
                                                    "worker_id" : "not assigned",
                                                    "type" : task_data.get('task'),
                                                    "status" : "queued",
                                                    "retry_count" : 0,
-                                                   "created_at" : str(dt.now()),
-                                                   "timestamp" : str(dt.now()),
+                                                   "created_at" : dt.now(),
+                                                   "timestamp" : dt.now(),
                                                    "error" : None
                                                 }
                         )
+                        # print("~~~~")
                         # log queued tasks
+                        queue_task_data = {
+                            "timestamp" : dt.now(),
+                            "title" : "Task_Information",
+                            "task_id" : task_id,
+                            "client_id" : task_data.get('client_id'),
+                            "worker_id" : "Not_Assigned_Yet",
+                            "task_type" : task_data.get('task'),
+                            "task_status" : "Queued",
+                            "retry_count" : 0,
+                            "error" : None
+                        }
+                        self.producer.send(LOG_TOPIC,value=queue_task_data)
+                        # print("------")
                         # log client details
-                        
+                        client_data = {
+                            "timestamp" : dt.now(),
+                            "title" : "Client_Information",
+                            "client_id" : task_data.get('client_id'),
+                            "task_id" : task_id,
+                            "task_type" : task_data.get('task'),
+                        }
+                        self.producer.send(LOG_TOPIC,value=client_data)
 
                     while (len(self.available_workers) == 0):
                         print("_________________Busy_______________")
@@ -192,6 +260,13 @@ class YADTQServer:
 
                 except Exception as e:
                     # log error
+                    error_log_montior_task = {
+                        "timestamp" : dt.now(),
+                        "title" : "error_Information",
+                        "Function" : "Monitor_Tasks",
+                        "error" : str(e)
+                    }
+                    self.producer.send(LOG_TOPIC,value=error_log_montior_task)
                     print(f"error reading msg: {e}")
 
 
@@ -204,20 +279,46 @@ class YADTQServer:
                     res_data = msg.value
                     task_id = res_data.get("task_id")
                     print("result:", res_data)
+                    result_data_client = {
+                          "task_id" : task_id,
+                          "client_id" : res_data.get('client_id'),
+                          "task_status" : res_data.get('task_status'),
+                          "result" : res_data.get('result')
+                    }
+                    self.producer.send(RESULT_TOPIC_CLIENT,value=result_data_client)
+
                     self.redis.hset(
                                     f"task : {task_id}",
                                     mapping = {
                                                "status" : "success",
-                                               "finished_at" : str(dt.now()),
-                                               "timestamp": str(dt.now()),
+                                               "finished_at" : dt.now(),
+                                               "timestamp": dt.now(),
                                                "error": None
                                             }
                     )
                     # log success tasks
-                    # needto remove worker from active workers here?
+                    success_task_data = {
+                        "timestamp" : dt.now(),
+                        "title" : "Task_Information",
+                        "task_id" : task_id,
+                        "client_id" : res_data.get('client_id'),
+                        "worker_id" : res_data.get('worker_id'),
+                        "task_type" : "?",
+                        "task_status" : "Success",
+                        "retry_count" : "?",
+                        "error" : None
+                    }
+                    self.producer.send(LOG_TOPIC,value=success_task_data)
 
                 except Exception as e:
                     # log error
+                    error_log_montior_result = {
+                        "timestamp" : dt.now(),
+                        "title" : "error_Information",
+                        "Function" : "Monitor_Results",
+                        "error" : str(e)
+                    }
+                    self.producer.send(LOG_TOPIC,value=error_log_montior_result)
                     print(f"error reading res: {e}")
                 
 
@@ -245,6 +346,8 @@ class YADTQServer:
                             self.retry_task(task_id)
                             # log dead worker
                         # else:
+                            # log zombie worker 
+
                         #     w_data = self.active_workers[w_id]
                         #     last_heartbeat = now_time - timedelta(seconds = now_time.timestamp() - w_data['last_heartbeat'])
                             
@@ -255,7 +358,14 @@ class YADTQServer:
             except Exception as e:
                 print(f"error in zombie tasks: {e}")
                 # log error
-            
+                error_log_montior_zombie = {
+                    "timestamp" : dt.now(),
+                    "title" : "error_Information",
+                    "Function" : "Monitor_Zombie_Tasks",
+                    "error" : str(e)
+                }
+                self.producer.send(LOG_TOPIC,value=error_log_montior_zombie)        
+
             time.sleep(self.retry_delay)
 
 
@@ -267,6 +377,7 @@ class YADTQServer:
                 try:
                     
                     heartbeat = msg.value
+                    task_id = heartbeat.get('task_id')
                     w_id = heartbeat.get('worker_id')
                     w_status = heartbeat.get('worker_status')
                     current_task = heartbeat.get('current_task')
@@ -278,8 +389,8 @@ class YADTQServer:
                     print(f"Worker states: {self.worker_states}")
 
                     task_data = self.redis.hgetall(f"task : {task_id}")
-                    # log busy and idle workers                  
-                    # log processing tasks (based on employed or idle)
+
+
 
                     ''' this was uhhh well uk wt to explain but keeping it here'''
                     # if (current_task):
@@ -308,6 +419,13 @@ class YADTQServer:
 
                 except Exception as e:
                     # log error
+                    error_log_heartbeat = {
+                        "timestamp" : dt.now(),
+                        "title" : "error_Information",
+                        "Function" : "Monitor_Heartbeat",
+                        "error" : str(e)
+                    }
+                    self.producer.send(LOG_TOPIC,value=error_log_heartbeat)                     
                     print(f"error heartbeat monitoring: {e}")
 
 
@@ -322,14 +440,27 @@ class YADTQServer:
             retry_count = int(task_data.get('retry_count', 0))
             client_id = task_data.get('client_id', '') # errorzzz
             
-            if retry_count >= self.retry_max:
+            if retry_count >= self.retry_max:   
                 print(f"task {task_id} max retries done")
                 # log max attempt task
+                max_retry_task_data = {
+                    "timestamp" : dt.now(),
+                    "title" : "Task_Information",
+                    "task_id" : task_id,
+                    "client_id" : task_data.get('client_id'),
+                    "worker_id" : task_data.get('worker_id'),
+                    "task_type" : task_data.get('type'),
+                    "task_status" : "Failed",
+                    "retry_count" : "3",
+                    "error" : "Maximum attempts at retry done"
+                }
+                self.producer.send(LOG_TOPIC,value=max_retry_task_data)
+
                 self.redis.hset(
                                 task_key,
                                 mapping = {
                                            "status" : "failed",
-                                           "timestamp": str(dt.now()),
+                                           "timestamp": dt.now(),
                                            "error" : "Exceeded maximum retry attempts"
                                         }
                 )
@@ -339,36 +470,55 @@ class YADTQServer:
                                     "error" : "Exceeded maximum retry attempts",
                                     "client_id" : client_id
                 }
-                self.producer.send(RESULT_TOPIC, value = msg_for_failures)
+                self.producer.send(RESULT_TOPIC_CLIENT, value = msg_for_failures)
                 return False
 
             #log retrying, queued task
 
             self.redis.hset(
-                            f"task : {task_id}",
+                            task_key,
                             mapping = {
                                        "status" : "queued",
                                        "retry_count" : (retry_count + 1),
-                                       "timestamp": str(dt.now()),
-                                       "error" : None
+                                       "timestamp": dt.now(),
+                                       "error" : None,
+                                       "worker_id" : None
                                     }
             )
 
-            ''' frgot why we added this please reviewww cu we aint usign it for shit '''
-            # task_message = {
-            #                 "task_id" : task_id,
-            #                 "task": task_data.get('type', 'unknown'),
-            #                 "args" : task_data.get('args', ''),
-            #                 "retry_count" : (retry_count + 1),
-            #                 "client_id" : client_id
-            # }
+            retry_task_message = {
+                                  "task_id" : task_id,
+                                  "task": task_data.get('type', 'unknown'),
+                                  "args" : task_data.get('args', ''),
+                                  "retry_count" : (retry_count + 1),
+                                  "client_id" : client_id
+            }
             
+            retry_log_data = {
+                              "timestamp" : dt.now(),
+                              "title" : "Task_Information",
+                              "task_id" : task_id,
+                              "client_id" : client_id,
+                              "worker_id" : "Not_Assigned_Yet",
+                              "task_type" : task_data.get('type'),
+                              "task_status" : "Retry_Queued",
+                              "retry_count" : retry_count + 1,
+                              "error" : None
+            }
+            self.producer.send(LOG_TOPIC, value = retry_log_data)
+
+            # task back into queue
             print(f"retrying task {task_id} [attempt {retry_count + 1}]")
-            # add this to the beginning of the queue with a new worker
-            # self.producer.send(TASK_TOPIC, value = task_message)
+            self.producer.send(TASK_TOPIC, value=retry_task_message)
             return True
         except Exception as e:
-            #log error
+            error_log = {
+                         "timestamp" : dt.now(),
+                         "title" : "error_Information",
+                         "function" : "Retry_Task",
+                         "error" : str(e)
+            }
+            self.producer.send(LOG_TOPIC, value=error_log)
             print(f"error in retrying itself, task {task_id}: {e}")
             return False
 
@@ -389,32 +539,38 @@ class YADTQServer:
                     "task_type" : task_data.get('task'),
                     "client_id" : task_data.get('client_id'),
                     "args" : task_data.get('args'),
-                    "timestamp" : str(dt.now())
+                    "timestamp" : dt.now()
             }
             # self.redis.hset(
             #                 f"task : {task_id}",
-            #                 mapping = {"status" : "processing", "start_time" : str(dt.now()), "type" : task_data['task'], "retry_count" : retry_count}
+            #                 mapping = {"status" : "processing", "start_time" : dt.now(), "type" : task_data['task'], "retry_count" : retry_count}
             # )
             self.producer.send(TASK_TOPIC_WORKER, value = data)
             print("giving to: ", wID)
-            # log processing tasks
+
         except Exception as e:
             print(f"task processing error for {task_id}:{e}")
 
             # task id, client id, worker id, task type, task status, timestamp,  error
             self.redis.hset(
-                            f"task:{task_id}",
+                            f"task : {task_id}",
                             mapping = {
                                         "client_id" : task_data.get('client_id'),
                                         "worker_id": None,
                                         "type": task_data.get('task'),
                                         "status": "failed",
-                                        "timestamp": str(dt.now()),
+                                        "timestamp": dt.now(),
                                         "error": e
                                     }
             )
             # log error
-
+            error_log_proc_task = {
+                "timestamp" : dt.now(),
+                "title" : "error_Information",
+                "Function" : "Process_Task",
+                "error" : str(e)
+            }
+            self.producer.send(LOG_TOPIC,value=error_log_proc_task) 
             # self.redis.hset(
             #                 f"task : {task_id}",
             #                 mapping = {"status" : "failed", "error" : str(e)}
@@ -448,7 +604,8 @@ class YADTQServer:
                     for w_id, w_data in self.active_workers.items():
                         worker_status = "active" if w_data['status'] == 'active' else "inactive"
                         task_status = f"doing {w_data['current_task']}" if w_data['current_task'] else "free"
-                        print(f"Worker {w_id} : {worker_status} | {task_status} | Last seen: {now_time - w_data['last_seen']:.1f}s ago")
+                        time_since_last_seen = (now_time - w_data['last_seen']).total_seconds()
+                        print(f"Worker {w_id} : {worker_status} | {task_status} | Last seen: {time_since_last_seen:.1f}s ago")
                 time.sleep(5)
         except KeyboardInterrupt:
             self.running = False

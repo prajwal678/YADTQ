@@ -3,7 +3,7 @@ import json
 import base64
 from datetime import datetime as dt
 from kafka import KafkaProducer, KafkaConsumer
-from config import KAFKA_BROKER, TASK_TOPIC, RESULT_TOPIC
+from config import KAFKA_BROKER, TASK_TOPIC, RESULT_TOPIC_CLIENT
 
 
 class YADTQClient:
@@ -14,7 +14,7 @@ class YADTQClient:
             value_serializer=lambda x: json.dumps(x).encode("utf-8"),
         )
         self.consumer = KafkaConsumer(
-            RESULT_TOPIC,
+            RESULT_TOPIC_CLIENT,
             bootstrap_servers=KAFKA_BROKER,
             group_id="client_group",
             value_deserializer=lambda x: json.loads(x.decode("utf-8")),
@@ -31,8 +31,8 @@ class YADTQClient:
         return int((self.MESSAGE_LIMIT - self.estimated_metadata_size) / overhead_factor)
 
     def write_file(self, content, dst_file_path):
-        with open(dst_file_path, "wb") as file:
-            file.write(base64.b64decode(content.encode("utf-8")))
+        with open(dst_file_path, "w") as file:
+            file.write(content)
 
     def send_task(self, task_type, file_path=None):
         task_id = str(uuid.uuid4())
@@ -41,29 +41,37 @@ class YADTQClient:
             "task_id": task_id,
             "task": task_type,
             "timestamp": str(dt.now()),
-            "total_parts": 0,
-            "args": {}
+            "total_parts": 1,
+            "args": {"part":1, "file_content":""}
         }
+        total_parts = 1
 
         try:
             with open(file_path, "rb") as file:
                 file_content = file.read()
+                print(file_content)
             file_size = len(file_content)
 
-            chunks = [file_content[i:i + self.max_chunk_size] for i in range(0, file_size, self.max_chunk_size)]
-            total_parts = len(chunks)
-            base_task_data["total_parts"] = total_parts
+            if file_size > self.max_chunk_size :
+                chunks = [file_content[i:i + self.max_chunk_size] for i in range(0, file_size, self.max_chunk_size)]
+                total_parts = len(chunks)
+                base_task_data["total_parts"] = total_parts
 
-            for part_num, chunk in enumerate(chunks, start=1):
-                task_chunk = base_task_data.copy()
-                task_chunk["args"]["part"] = part_num
-                task_chunk["args"]["file_content"] = base64.b64encode(chunk).decode("utf-8")
+                for part_num, chunk in enumerate(chunks, start=1):
+                    task_chunk = base_task_data.copy()
+                    task_chunk["args"]["part"] = part_num
+                    task_chunk["args"]["file_content"] = base64.b64encode(chunk).decode("utf-8")
 
-                # serialized_chunk = json.dumps(task_chunk).encode("utf-8")
-                # if len(serialized_chunk) > self.MESSAGE_LIMIT:
-                #     raise ValueError(f"Message size exceeds 1 MB for part {part_num}. Reduce metadata size or chunk size.")
+                    # serialized_chunk = json.dumps(task_chunk).encode("utf-8")
+                    # if len(serialized_chunk) > self.MESSAGE_LIMIT:
+                    #     raise ValueError(f"Message size exceeds 1 MB for part {part_num}. Reduce metadata size or chunk size.")
 
-                self.producer.send(TASK_TOPIC, value=task_chunk)
+                    print(task_chunk)
+                    self.producer.send(TASK_TOPIC, value=task_chunk)
+            else:
+                base_task_data["args"]["file_content"] = base64.b64encode(file_content).decode("utf-8")
+                print(base_task_data)
+                self.producer.send(TASK_TOPIC, value=base_task_data)
 
             print(f"Task {task_id} sent with {total_parts} part(s).")
             
@@ -77,18 +85,31 @@ class YADTQClient:
 
         return task_id
 
-    def get_result(self, task_id, dst_file_path=None):
+    def get_result(self, task_id, dst_file_path=None, task_type=None):
         for message in self.consumer:
             result_data = message.value
             if result_data["task_id"] == task_id:
                 status = result_data["task_status"]
                 if status == "success":
-                    if "file_content" in result_data:
-                        file_content = result_data["file_content"]
-                        self.write_file(file_content, dst_file_path)
-                        return f"Result file saved as {dst_file_path}"
-                    else:
-                        return result_data["result"]
+                    file_content = result_data["result"]
+                    if dst_file_path:
+                        try:
+                            # Add proper padding to the Base64 string
+                            file_content_padded = file_content + '' * (-len(file_content) % 4)
+                            
+                            if task_type in ["encode", "compression"]:
+                                self.write_file(file_content, dst_file_path)
+                            elif task_type in ["decode", "decompression"]:
+                                with open(dst_file_path, "w") as file:
+                                    file.write(file_content_padded)
+                            else:
+                                self.write_file(file_content, dst_file_path)
+
+                            return f"Result file saved as {dst_file_path}"
+
+                        except Exception as e:
+                            return f"Error writing to file: {e}"
+
                 elif status == "failed":
                     return f"Task failed: {result_data['error']}"
 
@@ -116,7 +137,7 @@ class YADTQClient:
                 return 1
 
             print(f"\n~Task {task_id} sent. Waiting for result...")
-            res = self.get_result(task_id, dst_file_path=dst_file_path)
+            res = self.get_result(task_id, dst_file_path, task_type)
             print(f"Result: {res}")
 
         elif ch == 5:

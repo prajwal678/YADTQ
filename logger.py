@@ -14,7 +14,7 @@ class KafkaLogger:
         )
         self.log_file = log_file
         self.buffer = []
-        self.write_interval = 5  
+        self.buffer_write_interval = 5  
         self.running = True
 
 
@@ -51,8 +51,8 @@ class KafkaLogger:
 
         except KeyboardInterrupt:
             print("stopping logger...")
-            self.running = False
             self.write_logs_to_file()
+            self.running = False
 
         except Exception as e:
             print(f"error in Kafka Logger: {e}")

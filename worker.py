@@ -48,16 +48,6 @@ class YADTQWorker:
                 print(f"error: ", e)
             time.sleep(5) 
 
-    # once sure of whats right, gonan implement it this way
-    # def file_op(self, task, file_data):
-    #     match task:
-    #         case "encode":
-    #             return base64.b64encode(file_data).decode
-
-
-    #is this the correct format ?
-    #decode option should be added in client 
-    
     def file_op(self, task, file_data):
         match task:
             case "encode":
@@ -81,9 +71,8 @@ class YADTQWorker:
         task_type = task_data.get("task_type")
         self.client_id = task_data.get("client_id")
         args = task_data.get("args")
-        # ok why encode utf8, b64decode adn then decode utf 8?
-        file_content = base64.b64decode(args["file_content"].encode("utf-8")) 
-        file_content_str = file_content.decode("utf-8") 
+        file_content = base64.b64decode(args["file_content"]) 
+        file_content_str = file_content.decode("utf-8")
 
         # print(file_content_str, type(file_content_str))
         # print("---------------------------------------")
@@ -92,12 +81,12 @@ class YADTQWorker:
         self.redis.hset(f"task:{task_id}", mapping={"client_id": self.client_id,"worker_id": self.workerID, "type": task_type,"status": "processing", "timestamp": str(dt.now()), "error": ""})
         
         try:
-            print(f"doing task {task_id}: {task_data['task']} with {file_content_str}")
+            print(f"doing task {task_id}: {task_data['task_type']} with {file_content_str}")
             self.current_task = task_id
             processed_data = self.file_op(task_type, file_content_str)
             
             time.sleep(7)
-            print(f"Finished task {task_id}: {task_data['task']} with {task_data['args']}")
+            print(f"Finished task {task_id}: {task_data['task_type']} with {task_data['args']}")
             self.client_id = None
             # little confusion, have to rename status as task_status or wtv status prply, and other things n all
             result_data = {
@@ -147,7 +136,7 @@ class YADTQWorker:
 
 
     def start(self):
-        print(f"worker {self.workerID} start") # needed to add this to see which is goign to what
+        print(f"worker {self.workerID} start")
         heartThread = Thread(target = self.send_heartbeat)
         heartThread.daemon = True 
         heartThread.start()
@@ -163,6 +152,5 @@ class YADTQWorker:
 
 
 wID = "w" + str(uuid.uuid4()) 
-print("wID:", wID)
 worker = YADTQWorker(workerID = wID)
 worker.start()
