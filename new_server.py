@@ -381,7 +381,18 @@ class YADTQServer:
 
                 now_time = dt.now()
                 for task_id, task_data in tasks_in_progress:
-                    start_time = dt.fromisoformat(dt(task_data.get('start_time', '')))
+                    try:
+                        start_time = dt.fromisoformat(task_data.get('start_time', ''))
+                    except Exception as e:
+                        print(f"\nerror in zombie tasks: {e}")
+                        # log error
+                        error_log_montior_zombie = {
+                            "timestamp" : str(dt.now()),
+                            "title" : "error_Information",
+                            "function" : "Monitor_Zombie_Tasks",
+                            "error" : str(e)
+                        }
+                        self.producer.send(LOG_TOPIC,value=error_log_montior_zombie)
                     runtime = now_time - start_time
                     
                     if runtime > timedelta(seconds = self.worker_timeout):
