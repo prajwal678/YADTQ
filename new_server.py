@@ -382,37 +382,42 @@ class YADTQServer:
                 now_time = dt.now()
                 for task_id, task_data in tasks_in_progress:
                     try:
-                        start_time = dt.fromisoformat(task_data.get('start_time', ''))
-                    except Exception as e:
-                        print(f"\nerror in zombie tasks: {e}")
-                        # log error
-                        error_log_montior_zombie = {
-                            "timestamp" : str(dt.now()),
-                            "title" : "error_Information",
-                            "function" : "Monitor_Zombie_Tasks",
-                            "error" : str(e)
+                        start_time_str = task_data.get('timestamp', '')
+                        if not start_time_str:
+                            raise ValueError("start_time is missing or empty")
+                        start_time = dt.fromisoformat(start_time_str)
+                        runtime = now_time - start_time
+
+                        if runtime > timedelta(seconds = self.worker_timeout):
+                            print(f"\ntask {task_id} stuck for {runtime}")
+                            w_id = task_data.get('worker_id')
+
+                            if not w_id or w_id not in self.active_workers:
+                                print(f"\nworker for {task_id} not active retrying")
+                                self.retry_task(task_id)
+                                # log dead worker
+                            # else:
+                                # log zombie worker 
+
+                            #     w_data = self.active_workers[w_id]
+                            #     last_heartbeat = now_time - timedelta(seconds = now_time.timestamp() - w_data['last_heartbeat'])
+                                
+                            #     if last_heartbeat > timedelta(seconds = self.worker_timeout):
+                            #         print(f"\nworker {w_id} dead lmao retrying {task_id}")
+                            #         # log zombie worker
+                            #         self.retry_task(task_id)
+                    except ValueError as ve:
+                        print(f"\nInvalid start_time for task {task_id}: {ve}")
+                        # Log invalid start_time error
+                        invalid_start_time_log = {
+                            "timestamp": str(dt.now()),
+                            "title": "error_Information",
+                            "function": "Monitor_Zombie_Tasks",
+                            "task_id": task_id,
+                            "error": f"Invalid start_time: {ve}"
                         }
-                        self.producer.send(LOG_TOPIC,value=error_log_montior_zombie)
-                    runtime = now_time - start_time
-                    
-                    if runtime > timedelta(seconds = self.worker_timeout):
-                        print(f"\ntask {task_id} stuck for {runtime}")
-                        w_id = task_data.get('worker_id')
+                        self.producer.send(LOG_TOPIC, value=invalid_start_time_log)
 
-                        if not w_id or w_id not in self.active_workers:
-                            print(f"\nworker for {task_id} not active retrying")
-                            self.retry_task(task_id)
-                            # log dead worker
-                        # else:
-                            # log zombie worker 
-
-                        #     w_data = self.active_workers[w_id]
-                        #     last_heartbeat = now_time - timedelta(seconds = now_time.timestamp() - w_data['last_heartbeat'])
-                            
-                        #     if last_heartbeat > timedelta(seconds = self.worker_timeout):
-                        #         print(f"\nworker {w_id} dead lmao retrying {task_id}")
-                        #         # log zombie worker
-                        #         self.retry_task(task_id)
             except Exception as e:
                 print(f"\nerror in zombie tasks: {e}")
                 # log error
